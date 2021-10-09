@@ -1,26 +1,25 @@
-import copy
-import itertools
-
+import cv2
 import torch
 from torch import nn
 from torch import optim
+from torchvision import transforms
 from torch.utils.data import dataloader
-from torch.autograd import Variable
 from tfrecord.torch.dataset import TFRecordDataset
 
 from tqdm import tqdm
 
-from models import CartoonGAN_G, DeCartoonGAN_G, GAN_D
+from models import CartoonGAN_G, VGG16
 
 import sys
+
 sys.path.append("..")
 import config
 import utils
 
 
-class BasicCycleGAN(object):
-    def __init__(self):
-        super(BasicCycleGAN, self).__init__()
+class BasicStyleTransfer(object):
+    def __init__(self, style_img_path, content_img_path):
+        super(BasicStyleTransfer, self).__init__()
         opt = config.get_options()
         self.device = torch.device("cuda" if opt.cuda else "cpu")
         self.niter = opt.niter
@@ -30,32 +29,112 @@ class BasicCycleGAN(object):
         self.lr = opt.lr
         self.output_dir = opt.output_dir
 
-        self.target_fake = Variable(torch.rand(self.batch_size) * 0.3).to(self.device)
-        self.target_real = Variable(torch.rand(self.batch_size) * 0.5 + 0.7).to(self.device)
+        # train model init
+        self.model_transfer = CartoonGAN_G().to(self.device)
+        self.vgg = VGG16().to(self.device)
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        self.model_transfer.apply(utils.weights_init)
 
-        # cyclegan for bgan, init
-        self.model_g_x2y = CartoonGAN_G().to(self.device)
-        self.model_g_y2x = DeCartoonGAN_G().to(self.device)
-        self.model_d_x = GAN_D().to(self.device)
-        self.model_d_y = GAN_D().to(self.device)
+        # prepare init
+        self.prep = transforms.Compose(
+            [
+                transforms.Lambda(lambda x: x.mul_(1 / 255)),
+                transforms.Normalize(
+                    mean=[0.40760392, 0.45795686, 0.48501961],
+                    # subtract imagenet mean, for BGR
+                    std=[0.225, 0.224, 0.229]
+                ),
+                transforms.Lambda(lambda x: x.mul_(255)),
+            ]
+        )
+        style_img = self.prep(torch.FloatTensor(cv2.imread(style_img_path).transpose(2, 0, 1))).to(self.device)
+        features_style = self.vgg(style_img.unsqueeze(0))
+        self.grams_style = [utils.calc_gram(feature_style.repeat(self.batch_size, 1, 1, 1)) for feature_style in
+                            features_style]
 
-        self.model_g_x2y.apply(utils.weights_init)
-        self.model_g_y2x.apply(utils.weights_init)
-        self.model_d_x.apply(utils.weights_init)
-        self.model_d_y.apply(utils.weights_init)
+        content_img = self.prep(torch.FloatTensor(cv2.imread(content_img_path).transpose(2, 0, 1))).to(self.device)
+        _, h, w = content_img.shape
+        self.features_content = self.vgg(content_img.unsqueeze(0)).relu3_3.repeat(self.batch_size, 1, 1, 1)
 
         # criterion init
-        self.criterion_generate = nn.MSELoss()
-        self.criterion_cycle = nn.L1Loss()
-        self.criterion_identity = nn.L1Loss()
+        self.criterion = nn.MSELoss()
+        self.style_weight = 1e6
+        self.content_weight = 1e0
+        self.tv_weight = 2e-2
 
         # dataset init
+        self.data_length = 10000
+        self.photo = torch.rand(
+            self.batch_size,
+            3,
+            h,
+            w
+        ).float().to(self.device) * 255
+
+        # optim init
+        self.optimizer_transfer = optim.Adam(
+            self.model_transfer.parameters(), lr=self.lr
+        )
+
+        # lr init
+        self.model_scheduler_transfer = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer_transfer, T_max=self.niter
+        )
+
+    def train_batch(self):
+        print("-----------------train-----------------")
+        for epoch in range(self.niter):
+            self.model_transfer.train()
+
+            epoch_losses_style = utils.AverageMeter()
+            epoch_losses_content = utils.AverageMeter()
+
+            with tqdm(total=(self.data_length - self.data_length % self.batch_size)) as t:
+                t.set_description('epoch: {}/{}'.format(epoch + 1, self.niter))
+                for _ in range(self.data_length):
+                    # --------------------
+                    # model transfer train
+                    # --------------------
+                    vangogh = self.model_transfer(self.photo)
+                    features_vangogh = self.vgg(vangogh)
+
+                    # get loss_content
+                    loss_content = self.criterion(self.features_content, features_vangogh.relu3_3)
+
+                    # get loss_style
+                    loss_style = 0
+                    for feature_vangogh, gram_style in zip(features_vangogh, self.grams_style):
+                        gram_vangogh = utils.calc_gram(feature_vangogh)
+                        loss_style += self.criterion(gram_vangogh, gram_style[:self.batch_size, :, :])
+
+                    loss_total = self.style_weight * loss_style + \
+                                 self.content_weight * loss_content
+
+                    self.optimizer_transfer.zero_grad()
+                    loss_total.backward()
+                    self.optimizer_transfer.step()
+                    epoch_losses_style.update(loss_style.item(), self.batch_size)
+                    epoch_losses_content.update(loss_content.item(), self.batch_size)
+
+                    t.set_postfix(
+                        loss_style='{:.6f}'.format(epoch_losses_style.avg),
+                        loss_content='{:.6f}'.format(epoch_losses_content.avg),
+                    )
+                    t.update(self.batch_size)
+
+            self.model_scheduler_transfer.step()
+
+
+class BasicFastStyleTransfer(BasicStyleTransfer):
+    def __init__(self, style_img_path, content_img_path=None):
+        super(BasicFastStyleTransfer, self).__init__(style_img_path=style_img_path, content_img_path=content_img_path)
         description = {
             "vangogh": "byte",
             "photo": "byte",
             "size": "int",
         }
-        train_dataset = TFRecordDataset("train.tfrecord", None, description)
+        train_dataset = TFRecordDataset("train.tfrecord", None, description, shuffle_queue_size=100)
         self.train_dataloader = dataloader.DataLoader(
             dataset=train_dataset,
             batch_size=self.batch_size,
@@ -63,177 +142,72 @@ class BasicCycleGAN(object):
             pin_memory=True,
             drop_last=True
         )
-        self.data_length = 10000  # ans of dataset.py
-
-        # valid_dataset = TFRecordDataset("valid.tfrecord", None, description)
-        # self.valid_dataloader = dataloader.DataLoader(
-        #     dataset=valid_dataset,
-        #     batch_size=1
-        # )
-
-        # optim init
-        self.optimizer_g = optim.Adam(
-            itertools.chain(self.model_g_x2y.parameters(), self.model_g_y2x.parameters()),
-            lr=self.lr, betas=(0.75, 0.999)
-        )
-        self.optimizer_d_x = optim.Adam(
-            self.model_d_x.parameters(),
-            lr=self.lr, betas=(0.5, 0.999)
-        )
-        self.optimizer_d_y = optim.Adam(
-            self.model_d_y.parameters(),
-            lr=self.lr, betas=(0.5, 0.999)
-        )
-
-        # lr init
-        self.model_scheduler_g = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer_g, T_max=self.niter
-        )
-        self.model_scheduler_d_x = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer_d_x, T_max=self.niter
-        )
-        self.model_scheduler_d_y = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer_d_y, T_max=self.niter
-        )
+        self.data_length = 400
 
     def train_batch(self):
-        cnt = 0
+        print("-----------------train-----------------")
         for epoch in range(self.niter):
-            self.model_g_x2y.train()
-            self.model_g_y2x.train()
+            self.model_transfer.train()
 
-            epoch_losses_g = utils.AverageMeter()
-            epoch_losses_d_x = utils.AverageMeter()
-            epoch_losses_d_y = utils.AverageMeter()
+            epoch_losses_style = utils.AverageMeter()
+            epoch_losses_content = utils.AverageMeter()
 
             with tqdm(total=(self.data_length - self.data_length % self.batch_size)) as t:
                 t.set_description('epoch: {}/{}'.format(epoch + 1, self.niter))
-
                 for record in self.train_dataloader:
-                    self.model_d_x.eval()
-                    self.model_d_y.eval()
-
-                    cnt += 1
-                    vangogh = record["vangogh"].reshape(
-                        self.batch_size,
-                        3,
-                        record["size"][0],
-                        record["size"][0]
-                    ).float().to(self.device)
                     photo = record["photo"].reshape(
                         self.batch_size,
                         3,
                         record["size"][0],
                         record["size"][0]
                     ).float().to(self.device)
-
-                    vangogh_noise = utils.concat_noise(vangogh, (4, 128, 128), vangogh.size()[0])
-                    photo_noise = utils.concat_noise(photo, (4, 128, 128), photo.size()[0])
+                    photo = self.prep(photo)
 
                     # --------------------
-                    # generator train(2 * model_g)
+                    # model transfer train
                     # --------------------
-                    loss_total, vangogh_fake, photo_fake = self._calc_loss_g(vangogh_noise, vangogh, photo_noise, photo)
+                    vangogh = self.model_transfer(photo)
+                    features_photo = self.vgg(photo)
+                    features_vangogh = self.vgg(vangogh)
 
-                    if cnt % self.batch_scale == 0:
-                        self.optimizer_g.zero_grad()
-                        loss_total.backward()
-                        epoch_losses_g.update(loss_total.item(), self.batch_size)
-                        self.optimizer_g.step()
+                    # get loss_content
+                    loss_content = self.criterion(features_photo.relu3_3, features_vangogh.relu3_3)
 
-                    # --------------------
-                    # discriminator vangogh train(model_d_x)
-                    # --------------------
-                    self.model_d_x.train()
-                    loss_total_d_x = self._calc_loss_d(vangogh_fake, vangogh)
+                    # get loss_style
+                    loss_style = 0
+                    for feature_vangogh, gram_style in zip(features_vangogh, self.grams_style):
+                        gram_vangogh = utils.calc_gram(feature_vangogh)
+                        loss_style += self.criterion(gram_vangogh, gram_style[:self.batch_size, :, :])
 
-                    if cnt % self.batch_scale == 0:
-                        self.optimizer_d_x.zero_grad()
-                        loss_total_d_x.backward()
-                        epoch_losses_d_x.update(loss_total_d_x.item(), self.batch_size)
-                        self.optimizer_d_x.step()
+                    # smooth
+                    diff_i = torch.sum(torch.abs(vangogh[:, :, :, 1:] - vangogh[:, :, :, :-1]))
+                    diff_j = torch.sum(torch.abs(vangogh[:, :, 1:, :] - vangogh[:, :, :-1, :]))
+                    loss_tv = (diff_i + diff_j) / float(3 * record["size"][0] ** 2)
 
-                    # --------------------
-                    # discriminator photo train(model_d_y)
-                    # --------------------
-                    self.model_d_y.train()
-                    loss_total_d_y = self._calc_loss_d(photo_fake, photo)
+                    loss_total = self.style_weight * loss_style + \
+                                 self.content_weight * loss_content + \
+                                 self.tv_weight * loss_tv
 
-                    if cnt % self.batch_scale == 0:
-                        self.optimizer_d_y.zero_grad()
-                        loss_total_d_y.backward()
-                        epoch_losses_d_y.update(loss_total_d_y.item(), self.batch_size)
-                        self.optimizer_d_y.step()
+                    self.optimizer_transfer.zero_grad()
+                    loss_total.backward()
+                    self.optimizer_transfer.step()
+                    epoch_losses_style.update(loss_style.item(), self.batch_size)
+                    epoch_losses_content.update(loss_content.item(), self.batch_size)
 
                     t.set_postfix(
-                        loss_g='{:.6f}'.format(epoch_losses_g.avg),
-                        loss_d_vangogh='{:.6f}'.format(epoch_losses_d_x.avg),
-                        loss_d_photo='{:.6f}'.format(epoch_losses_d_y.avg)
+                        loss_style='{:.6f}'.format(epoch_losses_style.avg),
+                        loss_content='{:.6f}'.format(epoch_losses_content.avg),
                     )
                     t.update(self.batch_size)
 
-            self.model_scheduler_g.step()
-            self.model_scheduler_d_x.step()
-            self.model_scheduler_d_y.step()
+            self.model_scheduler_transfer.step()
 
             torch.save(
-                self.model_g_x2y.state_dict(),
+                self.model_transfer.state_dict(),
                 "{}/photo2vangogh_snapshot_{}.pth".format(self.output_dir, epoch)
             )
 
-    def _calc_loss_g(self, vangogh_noise, vangogh, photo_noise, photo):
-        # loss identity(ATTN!: `a_same = model_b2a(a)`)
-        vangogh_same = self.model_g_x2y(vangogh_noise)  # model_g_x2y: photo --> vangogh
-        loss_identity_vangogh = self.criterion_identity(vangogh_same, vangogh)
-
-        photo_fake = self.model_g_y2x(photo)  # model_g_y2x: vangogh --> photo
-        loss_identity_photo = self.criterion_identity(photo_fake, photo)
-
-        # loss gan(ATTN!: `a_fake = model_b2a(b)`)
-        vangogh_fake = self.model_g_x2y(photo_noise)
-        vangogh_fake_feature = self.model_d_y(vangogh_fake)  # get vangogh features
-        loss_gan_x2y = self.criterion_generate(vangogh_fake_feature, self.target_real)
-
-        photo_fake = self.model_g_y2x(vangogh)
-        photo_fake_feature = self.model_d_x(photo_fake)  # get photo features
-        loss_gan_y2x = self.criterion_generate(photo_fake_feature, self.target_real)
-
-        photo_fake_noise = utils.concat_noise(photo_fake, (4, 128, 128), photo_fake.size()[0])
-
-        # loss cycle(ATTN!: `a_recover = model_b2a(b_fake)`)
-        vangogh_recover = self.model_g_x2y(photo_fake_noise)  # recover the vangogh: vangogh->photo->vangogh
-        loss_cycle_x2y = self.criterion_cycle(vangogh_recover, vangogh) * 2
-
-        photo_recover = self.model_g_y2x(vangogh_fake)  # recover the photo: photo->vangogh->photo
-        loss_cycle_y2x = self.criterion_cycle(photo_recover, photo) * 2
-
-        # loss total
-        loss_total = loss_identity_vangogh + loss_identity_photo + \
-                     loss_gan_x2y + loss_gan_y2x + \
-                     loss_cycle_x2y + loss_cycle_y2x
-
-        return loss_total, vangogh_recover, photo_recover
-
-    def _calc_loss_d(self, vangogh_fake, vangogh):
-        # loss real
-        pred_vangogh_real = self.model_d_x(vangogh)
-        loss_real = self.criterion_generate(pred_vangogh_real, self.target_real)
-
-        # loss fake
-        vangogh_fake_ = copy.deepcopy(vangogh_fake.data)
-        pred_vangogh_fake = self.model_d_x(vangogh_fake_.detach())
-        loss_fake = self.criterion_generate(pred_vangogh_fake, self.target_fake)
-
-        # loss rbl
-        loss_rbl = - torch.log(abs(loss_real - loss_fake)) \
-                   - torch.log(abs(1 - loss_fake - loss_real))
-
-        # loss total
-        loss_total = (loss_real + loss_fake) * 0.5 + loss_rbl * 0.01
-
-        return loss_total
-
 
 if __name__ == "__main__":
-    cartoon = BasicCycleGAN()
+    cartoon = BasicFastStyleTransfer(style_img_path="vangogh.jpg")
     cartoon.train_batch()

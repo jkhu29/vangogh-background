@@ -1,5 +1,6 @@
-import torch
 import torch.nn as nn
+import torchvision
+from collections import namedtuple
 
 
 def _make_layer(block, num_layers, **kwargs):
@@ -14,12 +15,14 @@ class ConvReLU(nn.Module):
     def __init__(self, in_channels, out_channels, withbn=False):
         super(ConvReLU, self).__init__()
         self.withbn = withbn
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False)
+        self.pad = nn.ReflectionPad2d((1, 1, 1, 1))
         self.bn = nn.InstanceNorm2d(out_channels)
         self.relu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
         x = self.conv(x)
+        x = self.pad(x)
         if self.withbn:
             x = self.bn(x)
         x = self.relu(x)
@@ -31,133 +34,133 @@ class ConvTranReLU(nn.Module):
     def __init__(self, in_channels, out_channels, withbn=False):
         super(ConvTranReLU, self).__init__()
         self.withbn = withbn
-        self.convtran = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.convtran = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.upsample = nn.UpsamplingBilinear2d(scale_factor=2)
         self.bn = nn.InstanceNorm2d(out_channels)
-        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.relu = nn.LeakyReLU(0.2)
 
     def forward(self, x):
         x = self.convtran(x)
         if self.withbn:
             x = self.bn(x)
         x = self.relu(x)
+        x = self.upsample(x)
         return x
 
 
 class ResBlock(nn.Module):
-    """ResBlock used by CartoonGAN and DeCartoonGAN"""
+    """ResBlock used by CartoonGAN"""
     def __init__(self, num_conv=5, channels=64):
         super(ResBlock, self).__init__()
-
         self.conv_relu = _make_layer(ConvReLU, num_layers=num_conv, in_channels=channels, out_channels=channels)
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
 
-        self.dropout = nn.Dropout2d(0.5, inplace=True)
-
     def forward(self, x):
         x = self.conv_relu(x)
-        res = x
-        if self.training:
-            x = self.dropout(x)
-        x = self.conv(x) + res
+        x = self.conv(x) + x
         return x
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, num_features, reduction):
+        super(ChannelAttention, self).__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(num_features, num_features // reduction, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_features // reduction, num_features, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.conv(self.avg_pool(x))
+
+
+class CAB(nn.Module):
+    def __init__(self, num_features, reduction: int = 8):
+        super(CAB, self).__init__()
+        self.module = nn.Sequential(
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
+            ChannelAttention(num_features, reduction)
+        )
+
+    def forward(self, x):
+        return self.module(x)
 
 
 class CartoonGAN_G(nn.Module):
     """the G of CartoonGAN, use conv-transpose to up sample"""
-    def __init__(self, in_channels=3, out_channels=64, num_resblocks=8):
+    def __init__(self, in_channels=3, out_channels=32, num_resblocks=5):
         super(CartoonGAN_G, self).__init__()
 
-        self.in_channels = in_channels + 4
-        self.num_resblocks = num_resblocks
-
-        self.conv_relu1 = _make_layer(ConvReLU, num_layers=1, in_channels=self.in_channels, out_channels=out_channels)
-
-        # down sample
-        self.conv_relu2 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels * 2, withbn=True)
-        self.conv_relu3 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels * 4)
-
-        self.res1 = _make_layer(ResBlock, num_layers=self.num_resblocks, num_conv=2, channels=out_channels * 4)
-
-        # up sample
-        self.convup_relu1 = _make_layer(ConvTranReLU, num_layers=1, in_channels=out_channels * 4, out_channels=out_channels * 2, withbn=True)
-        self.convup_relu2 = _make_layer(ConvTranReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels)
-
-        self.conv4 = nn.Conv2d(out_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False)
-
-    def forward(self, x):
-        x = self.conv_relu1(x)
-        res = x
-        x = self.conv_relu2(x)
-        x = self.conv_relu3(x)
-        x = self.res1(x)
-        x = self.convup_relu1(x)
-        x = self.convup_relu2(x)
-        x = res + x
-        del res
-        x = self.conv4(x)
-        return x
-
-
-class DeCartoonGAN_G(CartoonGAN_G):
-    """the G of DeCartoonGAN, use conv-transpose to up sample"""
-    def __init__(self, in_channels=3, out_channels=64, num_resblocks=4):
-        super(DeCartoonGAN_G, self).__init__()
         self.in_channels = in_channels
         self.num_resblocks = num_resblocks
 
         self.conv_relu1 = _make_layer(ConvReLU, num_layers=1, in_channels=self.in_channels, out_channels=out_channels)
 
         # down sample
-        self.conv_relu2 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels * 2, withbn=True)
-        self.conv_relu3 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels * 4)
+        self.conv_relu2 = _make_layer(CAB, num_layers=1, num_features=out_channels)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv_relu3 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels * 2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.res1 = _make_layer(ResBlock, num_layers=self.num_resblocks, num_conv=2, channels=out_channels * 4)
+        self.res1 = _make_layer(ResBlock, num_layers=self.num_resblocks, num_conv=1, channels=out_channels * 2)
 
         # up sample
-        self.convup_relu1 = _make_layer(ConvTranReLU, num_layers=1, in_channels=out_channels * 4, out_channels=out_channels * 2, withbn=True)
-        self.convup_relu2 = _make_layer(ConvTranReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels)
+        self.convup_relu1 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels, withbn=True)
+        self.convup_relu2 = _make_layer(CAB, num_layers=1, num_features=out_channels)
 
         self.conv4 = nn.Conv2d(out_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False)
 
+    def forward(self, x):
+        x = self.conv_relu1(x)
+        res1 = x
+        x = self.conv_relu2(x)
+        res2 = x
+        x = self.conv_relu3(x)
+        x = self.res1(x)
+        x = self.convup_relu1(x) + res2
+        x = self.convup_relu2(x) + res1
+        del res2, res1
+        x = self.conv4(x)
+        return x
 
-class GAN_D(nn.Module):
-    """GAN_D: VGG19"""
+
+class VGG16(nn.Module):
     def __init__(self):
-        super(GAN_D, self).__init__()
-        self.net_d = [nn.Conv2d(3, 64, kernel_size=3, padding=1)]
-        self.net_d.extend([nn.LeakyReLU(0.2)])
-        self._conv_block(64, 64, with_stride=True)
-        self._conv_block(64, 128)
-        self._conv_block(128, 128, with_stride=True)
-        self._conv_block(128, 256)
-        self._conv_block(256, 256, with_stride=True)
-        self._conv_block(256, 512)
-        self._conv_block(512, 512, with_stride=True)
-        self.net_d.extend([nn.AdaptiveAvgPool2d(1)])
-        self.net_d.extend([nn.Conv2d(512, 1024, kernel_size=1)])
-        self.net_d.extend([nn.LeakyReLU(0.2)])
-        self.net_d.extend([nn.Conv2d(1024, 1, kernel_size=1)])
-        self.net_d = nn.Sequential(*self.net_d)
+        super(VGG16, self).__init__()
+        vgg_pretrained_features = torchvision.models.vgg16(pretrained=True).features
+        self.slice1 = nn.Sequential()
+        self.slice2 = nn.Sequential()
+        self.slice3 = nn.Sequential()
+        self.slice4 = nn.Sequential()
+        for x in range(4):
+            self.slice1.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(4, 9):
+            self.slice2.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(9, 16):
+            self.slice3.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(16, 23):
+            self.slice4.add_module(str(x), vgg_pretrained_features[x])
 
-    def _conv_block(self, in_channels, out_channels, with_batch=True, with_stride=False):
-        if with_stride:
-            self.net_d.extend([nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False)])
-        else:
-            self.net_d.extend([nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)])
-
-        if with_batch:
-            self.net_d.extend([nn.BatchNorm2d(out_channels)])
-        self.net_d.extend([nn.LeakyReLU(0.2, inplace=True)])
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        return torch.sigmoid(self.net_d(x).view(batch_size))
+    def forward(self, X):
+        h = self.slice1(X)
+        h_relu1_2 = h
+        h = self.slice2(h)
+        h_relu2_2 = h
+        h = self.slice3(h)
+        h_relu3_3 = h
+        h = self.slice4(h)
+        h_relu4_3 = h
+        vgg_outputs = namedtuple("VggOutputs", ["relu1_2", "relu2_2", "relu3_3", "relu4_3"])
+        out = vgg_outputs(h_relu1_2, h_relu2_2, h_relu3_3, h_relu4_3)
+        return out
 
 
-class FeatureExtractor(nn.Module):
-    def __init__(self, cnn, feature_layer=11):
-        super(FeatureExtractor, self).__init__()
-        self.features = nn.Sequential(*list(cnn.features.children())[:(feature_layer+1)])
-
-    def forward(self, x):
-        return self.features(x)
+if __name__ == "__main__":
+    from torchsummary import summary
+    a = CartoonGAN_G().cuda()
+    summary(a, (3, 64, 64))

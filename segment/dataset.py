@@ -17,12 +17,11 @@ for img_name in os.listdir(data_path):
     cnt += 1
 
     img = cv2.imread(os.path.join(data_path, img_name))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (192 * 4, 192 * 3))
+    img = cv2.resize(img, (192 * 3, 192 * 4))
     img = img.transpose(2, 0, 1)
 
     label = cv2.imread(os.path.join(data_path, label_name), 0)
-    label = cv2.resize(label, (192 * 4, 192 * 3))
+    label = cv2.resize(label, (192 * 3, 192 * 4))
 
     writer.write({
         "inputs": (img.tobytes(), "byte"),

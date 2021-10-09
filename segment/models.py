@@ -33,7 +33,7 @@ class ResBlockU(nn.Module):
         self.decoder_conv2 = ConvReLU(midden_channels * 2, midden_channels)
         self.decoder_conv1 = ConvReLU(midden_channels * 2, out_channels)
 
-        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear")
 
     def forward(self, x):
         xin = self.conv_in(x)
@@ -72,7 +72,7 @@ class ResBlockUF(nn.Module):
         self.decoder_conv2 = ConvReLU(midden_channels * 2, midden_channels, 2)
         self.decoder_conv1 = ConvReLU(midden_channels * 2, out_channels)
 
-        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear")
 
     def forward(self, x):
         x = self.conv_in(x)
@@ -116,20 +116,20 @@ class U2Net(nn.Module):
         self.stage2d = ResBlockU(256, 32, 64)
         self.stage1d = ResBlockU(128, 16, 64)
 
-        self.side1 = nn.Conv2d(64, out_channels, 3, padding=1)
-        self.side2 = nn.Conv2d(64, out_channels, 3, padding=1)
-        self.side3 = nn.Conv2d(128, out_channels, 3, padding=1)
-        self.side4 = nn.Conv2d(256, out_channels, 3, padding=1)
-        self.side5 = nn.Conv2d(512, out_channels, 3, padding=1)
-        self.side6 = nn.Conv2d(512, out_channels, 3, padding=1)
+        self.side1 = nn.Conv2d(64, 1, 3, padding=1)
+        self.side2 = nn.Conv2d(64, 1, 3, padding=1)
+        self.side3 = nn.Conv2d(128, 1, 3, padding=1)
+        self.side4 = nn.Conv2d(256, 1, 3, padding=1)
+        self.side5 = nn.Conv2d(512, 1, 3, padding=1)
+        self.side6 = nn.Conv2d(512, 1, 3, padding=1)
 
-        self.upscore6 = nn.Upsample(scale_factor=32, mode='bilinear', align_corners=False)
-        self.upscore5 = nn.Upsample(scale_factor=16, mode='bilinear', align_corners=False)
-        self.upscore4 = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False)
-        self.upscore3 = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
-        self.upscore2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.upscore6 = nn.Upsample(scale_factor=32, mode='bilinear')
+        self.upscore5 = nn.Upsample(scale_factor=16, mode='bilinear')
+        self.upscore4 = nn.Upsample(scale_factor=8, mode='bilinear')
+        self.upscore3 = nn.Upsample(scale_factor=4, mode='bilinear')
+        self.upscore2 = nn.Upsample(scale_factor=2, mode='bilinear')
 
-        self.outconv = nn.Conv2d(6 * out_channels, out_channels, 1)
+        self.outconv = nn.Conv2d(6, 1, 1)
 
     def forward(self, x):
         hx = x

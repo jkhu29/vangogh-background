@@ -13,11 +13,11 @@ def upsampling(img, x, y):
     return func(img)
 
 
-def generate_noise(size, channels=1, type='gaussian', scale=2):
+def generate_noise(size, channels=1, type='gaussian', scale=2, noise=None):
     if type == 'gaussian':
         noise = torch.randn(channels, size[0], round(size[1]/scale), round(size[2]/scale))
         noise = upsampling(noise, size[1], size[2])
-    if type =='gaussian_mixture':
+    if type == 'gaussian_mixture':
         noise1 = torch.randn(channels, size[0], size[1], size[2]) + 5
         noise2 = torch.randn(channels, size[0], size[1], size[2])
         noise = noise1 + noise2
@@ -34,6 +34,14 @@ def concat_noise(img, *args):
         img = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
     mixed_img = torch.cat((img, noise), 1)
     return mixed_img
+
+
+def calc_gram(x):
+    n, c, h, w = x.shape
+    f = x.view(n, c, w * h)
+    f_trans = f.transpose(1, 2)
+    gram = f.bmm(f_trans).div_(c * h * w)
+    return gram
 
 
 class AverageMeter(object):

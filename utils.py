@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -15,7 +16,7 @@ def upsampling(img, x, y):
 
 def generate_noise(size, channels=1, type='gaussian', scale=2, noise=None):
     if type == 'gaussian':
-        noise = torch.randn(channels, size[0], round(size[1]/scale), round(size[2]/scale))
+        noise = torch.randn(channels, size[0], round(size[1] / scale), round(size[2] / scale))
         noise = upsampling(noise, size[1], size[2])
     if type == 'gaussian_mixture':
         noise1 = torch.randn(channels, size[0], size[1], size[2]) + 5
@@ -42,6 +43,31 @@ def calc_gram(x):
     f_trans = f.transpose(1, 2)
     gram = f.bmm(f_trans).div_(c * h * w)
     return gram
+
+
+def rgb2lum(arr):
+    small = np.where(arr <= 0.04045)
+    big = np.where(arr > 0.04045)
+    arr[small] /= 12.92
+    arr[big] = ((arr[big] + 0.055) / 1.055) ** 2.4
+    return arr
+
+
+def lum(image):
+    """
+    turn BGR to Lum
+    :param image: image in sRGB area, range 255
+    :return: image in Lum
+    """
+    assert image.shape[0] == 3, "make sure the layout is (c, h, w), BGR"
+    _, h, w = image.shape
+    image = image.astype(np.float)
+    v_b = image[0, ...] / 255
+    v_g = image[1, ...] / 255
+    v_r = image[2, ...] / 255
+    print(rgb2lum(v_r))
+    l_image = 0.2126 * rgb2lum(v_r) + 0.7152 * rgb2lum(v_g) + 0.0722 * rgb2lum(v_b)
+    return l_image
 
 
 class AverageMeter(object):

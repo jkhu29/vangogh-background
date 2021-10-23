@@ -34,43 +34,41 @@ class BasicStyleTransfer(object):
         self.vgg = VGG16().to(self.device)
         for param in self.vgg.parameters():
             param.requires_grad = False
-        self.model_transfer.apply(utils.weights_init)
+        # self.model_transfer.apply(utils.weights_init)
+        model_params = torch.load("pretrain.pth")
+        self.model_transfer.load_state_dict(model_params)
 
         # prepare init
         self.prep = transforms.Compose(
             [
-                transforms.Lambda(lambda x: x.mul_(1 / 255)),
                 transforms.Normalize(
                     mean=[0.40760392, 0.45795686, 0.48501961],
                     # subtract imagenet mean, for BGR
                     std=[0.225, 0.224, 0.229]
-                ),
-                transforms.Lambda(lambda x: x.mul_(255)),
+                )
             ]
         )
-        style_img = self.prep(torch.FloatTensor(cv2.imread(style_img_path).transpose(2, 0, 1))).to(self.device)
-        features_style = self.vgg(style_img.unsqueeze(0))
-        self.grams_style = [utils.calc_gram(feature_style.repeat(self.batch_size, 1, 1, 1)) for feature_style in
-                            features_style]
-
-        content_img = self.prep(torch.FloatTensor(cv2.imread(content_img_path).transpose(2, 0, 1))).to(self.device)
-        _, h, w = content_img.shape
-        self.features_content = self.vgg(content_img.unsqueeze(0)).relu3_3.repeat(self.batch_size, 1, 1, 1)
+        style_img = torch.FloatTensor(cv2.imread(style_img_path).transpose(2, 0, 1)).to(self.device)
+        features_style = self.vgg(self.prep(style_img.unsqueeze(0)/255)*255)
+        self.grams_style = [utils.calc_gram(feature_style.repeat(self.batch_size, 1, 1, 1)) for feature_style in features_style]
+        if content_img_path is not None:
+            content_img = self.prep(torch.FloatTensor(cv2.imread(content_img_path).transpose(2, 0, 1))).to(self.device)
+            _, h, w = content_img.shape
+            self.photo = torch.rand(
+                self.batch_size,
+                3,
+                h,
+                w
+            ).float().to(self.device) * 255
+            self.features_content = self.vgg(content_img.unsqueeze(0)).relu3_3.repeat(self.batch_size, 1, 1, 1)
 
         # criterion init
         self.criterion = nn.MSELoss()
-        self.style_weight = 1e6
-        self.content_weight = 1e0
-        self.tv_weight = 2e-2
+        self.style_weight = 30
+        self.content_weight = 1
 
         # dataset init
         self.data_length = 10000
-        self.photo = torch.rand(
-            self.batch_size,
-            3,
-            h,
-            w
-        ).float().to(self.device) * 255
 
         # optim init
         self.optimizer_transfer = optim.Adam(
@@ -142,7 +140,7 @@ class BasicFastStyleTransfer(BasicStyleTransfer):
             pin_memory=True,
             drop_last=True
         )
-        self.data_length = 400
+        self.data_length = 4000
 
     def train_batch(self):
         print("-----------------train-----------------")
@@ -151,6 +149,7 @@ class BasicFastStyleTransfer(BasicStyleTransfer):
 
             epoch_losses_style = utils.AverageMeter()
             epoch_losses_content = utils.AverageMeter()
+            epoch_losses_tv = utils.AverageMeter()
 
             with tqdm(total=(self.data_length - self.data_length % self.batch_size)) as t:
                 t.set_description('epoch: {}/{}'.format(epoch + 1, self.niter))
@@ -161,17 +160,24 @@ class BasicFastStyleTransfer(BasicStyleTransfer):
                         record["size"][0],
                         record["size"][0]
                     ).float().to(self.device)
-                    photo = self.prep(photo)
 
                     # --------------------
                     # model transfer train
                     # --------------------
                     vangogh = self.model_transfer(photo)
-                    features_photo = self.vgg(photo)
-                    features_vangogh = self.vgg(vangogh)
+                    photo_p = self.prep(photo / 255) * 255
+                    vangogh_p = self.prep(vangogh / 255) * 255
+                    features_photo = self.vgg(photo_p)
+                    features_vangogh = self.vgg(vangogh_p)
+                    del photo_p, vangogh_p
 
                     # get loss_content
-                    loss_content = self.criterion(features_photo.relu3_3, features_vangogh.relu3_3)
+                    loss_content = self.criterion(features_photo.relu2_2, features_vangogh.relu2_2)
+                    
+                    # get loss tv
+                    diff_i = torch.sum(torch.abs(vangogh[..., 1:] - vangogh[..., :-1]))
+                    diff_j = torch.sum(torch.abs(vangogh[..., 1:, :] - vangogh[..., :-1, :]))
+                    loss_tv = diff_i + diff_j
 
                     # get loss_style
                     loss_style = 0
@@ -179,24 +185,20 @@ class BasicFastStyleTransfer(BasicStyleTransfer):
                         gram_vangogh = utils.calc_gram(feature_vangogh)
                         loss_style += self.criterion(gram_vangogh, gram_style[:self.batch_size, :, :])
 
-                    # smooth
-                    diff_i = torch.sum(torch.abs(vangogh[:, :, :, 1:] - vangogh[:, :, :, :-1]))
-                    diff_j = torch.sum(torch.abs(vangogh[:, :, 1:, :] - vangogh[:, :, :-1, :]))
-                    loss_tv = (diff_i + diff_j) / float(3 * record["size"][0] ** 2)
-
                     loss_total = self.style_weight * loss_style + \
-                                 self.content_weight * loss_content + \
-                                 self.tv_weight * loss_tv
+                                 self.content_weight * loss_content + 5e-6 * loss_tv
 
                     self.optimizer_transfer.zero_grad()
                     loss_total.backward()
                     self.optimizer_transfer.step()
                     epoch_losses_style.update(loss_style.item(), self.batch_size)
                     epoch_losses_content.update(loss_content.item(), self.batch_size)
+                    epoch_losses_tv.update(loss_tv.item(), self.batch_size)
 
                     t.set_postfix(
                         loss_style='{:.6f}'.format(epoch_losses_style.avg),
                         loss_content='{:.6f}'.format(epoch_losses_content.avg),
+                        loss_tv='{:.6f}'.format(epoch_losses_tv.avg),
                     )
                     t.update(self.batch_size)
 

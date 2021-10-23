@@ -18,7 +18,7 @@ class ConvReLU(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False)
         self.pad = nn.ReflectionPad2d((1, 1, 1, 1))
         self.bn = nn.InstanceNorm2d(out_channels)
-        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.relu = nn.LeakyReLU(0.2)
 
     def forward(self, x):
         x = self.conv(x)
@@ -34,13 +34,15 @@ class ConvTranReLU(nn.Module):
     def __init__(self, in_channels, out_channels, withbn=False):
         super(ConvTranReLU, self).__init__()
         self.withbn = withbn
-        self.convtran = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pad = nn.ReflectionPad2d((1, 1, 1, 1))
+        self.convtran = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False)
         self.upsample = nn.UpsamplingBilinear2d(scale_factor=2)
         self.bn = nn.InstanceNorm2d(out_channels)
         self.relu = nn.LeakyReLU(0.2)
 
     def forward(self, x):
         x = self.convtran(x)
+        x = self.pad(x)
         if self.withbn:
             x = self.bn(x)
         x = self.relu(x)
@@ -68,7 +70,7 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.conv = nn.Sequential(
             nn.Conv2d(num_features, num_features // reduction, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
+            # nn.ReLU(inplace=True),
             nn.Conv2d(num_features // reduction, num_features, kernel_size=1, bias=True),
             nn.Sigmoid()
         )
@@ -82,7 +84,7 @@ class CAB(nn.Module):
         super(CAB, self).__init__()
         self.module = nn.Sequential(
             nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2),
+            # nn.LeakyReLU(0.2),
             nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
             ChannelAttention(num_features, reduction)
         )
@@ -102,16 +104,14 @@ class CartoonGAN_G(nn.Module):
         self.conv_relu1 = _make_layer(ConvReLU, num_layers=1, in_channels=self.in_channels, out_channels=out_channels)
 
         # down sample
-        self.conv_relu2 = _make_layer(CAB, num_layers=1, num_features=out_channels)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv_relu3 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels * 2)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv_relu2 = _make_layer(ConvReLU, num_layers=2, in_channels=out_channels, out_channels=out_channels)
+        self.conv_relu3 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels * 2, withbn=True)
 
         self.res1 = _make_layer(ResBlock, num_layers=self.num_resblocks, num_conv=1, channels=out_channels * 2)
 
         # up sample
         self.convup_relu1 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels * 2, out_channels=out_channels, withbn=True)
-        self.convup_relu2 = _make_layer(CAB, num_layers=1, num_features=out_channels)
+        self.convup_relu2 = _make_layer(ConvReLU, num_layers=1, in_channels=out_channels, out_channels=out_channels)
 
         self.conv4 = nn.Conv2d(out_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False)
 
@@ -122,8 +122,10 @@ class CartoonGAN_G(nn.Module):
         res2 = x
         x = self.conv_relu3(x)
         x = self.res1(x)
-        x = self.convup_relu1(x) + res2
-        x = self.convup_relu2(x) + res1
+        x = self.convup_relu1(x)
+        x = x + res2
+        x = self.convup_relu2(x)
+        x = x + res1
         del res2, res1
         x = self.conv4(x)
         return x
